@@ -91,16 +91,30 @@ class RegenerateMessageResponse(BaseModel):
     source: str
 
 
+class PipelineStageLead(BaseModel):
+    id: str
+    company_name: str
+    deal_value: float
+
+
+class PipelineStageSummary(BaseModel):
+    stage: str
+    count: int
+    total_value: float
+    leads: list[PipelineStageLead]
+
+
 class DashboardSummary(BaseModel):
     total_leads: int
     total_pipeline_value: float
     total_revenue_at_risk: float
     avg_conversion_probability: float
     leads_by_stage: dict[str, int]
+    pipeline_stages: list[PipelineStageSummary] = []
     urgent_leads: int
     leads_needing_followup: int
     leads_at_risk_count: int = 0
     leads_at_risk: list[dict] = []
     hot_leads: list[dict] = []
     followups_due_today: list[dict] = []
-    top_recommendations: list[dict] = []
+    ai_insights: list[str] = []

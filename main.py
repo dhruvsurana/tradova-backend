@@ -14,6 +14,8 @@ from models import (
     DashboardSummary,
     Lead,
     LeadSummary,
+    PipelineStageLead,
+    PipelineStageSummary,
     RegenerateMessageResponse,
     SendFollowUpRequest,
     SendFollowUpResponse,
@@ -293,18 +295,63 @@ def create_lead(body: CreateLeadRequest):
     return lead
 
 
+# ── Canonical stage ordering (for consistent frontend display) ─────────────
+_STAGE_ORDER = ["new", "follow-up", "quoted", "negotiation", "closing"]
+
+_STAGE_DISPLAY: dict[str, str] = {
+    "new": "New",
+    "follow-up": "Follow-Up",
+    "quoted": "Quoted",
+    "negotiation": "Negotiation",
+    "closing": "Closing",
+}
+
+
 # ── GET /dashboard/summary ─────────────────────────────────────────────────
 
 @app.get("/dashboard/summary", response_model=DashboardSummary)
 def dashboard_summary():
-    """Aggregated pipeline stats for the dashboard view."""
+    """Aggregated pipeline stats for the dashboard view.
+
+    All data is computed from live in-memory lead state — every mutation
+    (send-followup, create lead, etc.) is automatically reflected here.
+    """
     leads = list(LEADS.values())
     total = len(leads)
 
+    # ── Per-stage aggregation (single pass) ────────────────────────────
     stage_counts: dict[str, int] = {}
-    for lead in leads:
-        stage_counts[lead.stage] = stage_counts.get(lead.stage, 0) + 1
+    stage_values: dict[str, float] = {}
+    stage_leads: dict[str, list[PipelineStageLead]] = {}
 
+    for lead in leads:
+        s = lead.stage
+        stage_counts[s] = stage_counts.get(s, 0) + 1
+        stage_values[s] = stage_values.get(s, 0) + lead.deal_value
+        stage_leads.setdefault(s, []).append(
+            PipelineStageLead(
+                id=lead.id,
+                company_name=lead.company_name,
+                deal_value=lead.deal_value,
+            )
+        )
+
+    ordered_stages = [s for s in _STAGE_ORDER if s in stage_counts]
+    for s in stage_counts:
+        if s not in ordered_stages:
+            ordered_stages.append(s)
+
+    pipeline_stages = [
+        PipelineStageSummary(
+            stage=_STAGE_DISPLAY.get(s, s.replace("-", " ").title()),
+            count=stage_counts[s],
+            total_value=stage_values[s],
+            leads=sorted(stage_leads[s], key=lambda l: -l.deal_value),
+        )
+        for s in ordered_stages
+    ]
+
+    # ── Scalar aggregations ────────────────────────────────────────────
     total_pipeline = sum(l.deal_value for l in leads)
     total_risk = sum(l.revenue_at_risk for l in leads)
     avg_prob = sum(l.conversion_probability for l in leads) / total if total else 0
@@ -330,11 +377,25 @@ def dashboard_summary():
         {"id": l.id, "company_name": l.company_name, "days_inactive": l.days_inactive}
         for l in leads if l.days_inactive >= 5
     ]
-    sorted_leads = sorted(leads, key=lambda l: -l.priority_score)
-    top_recommendations = [
-        {"id": l.id, "company_name": l.company_name, "ai_recommendation": l.ai_recommendation, "recommendation_text": l.recommendation_text}
-        for l in sorted_leads[:5]
-    ]
+
+    # ── AI Insights (OpenAI when available, else deterministic fallback) ──
+    max_inactive = max((l.days_inactive for l in leads), default=0)
+    leads_inactive_over_7 = sum(1 for l in leads if l.days_inactive > 7)
+
+    ai_insights, _source = ai_service.generate_ai_insights(
+        total_leads=total,
+        total_pipeline_value=total_pipeline,
+        total_revenue_at_risk=total_risk,
+        avg_conversion_probability=round(avg_prob, 1),
+        leads_by_stage=stage_counts,
+        stage_values=stage_values,
+        urgent_leads=urgent,
+        leads_needing_followup=needs_followup,
+        at_risk_count=len(at_risk),
+        hot_lead_count=len(hot_leads),
+        max_inactive_days=max_inactive,
+        leads_inactive_over_7=leads_inactive_over_7,
+    )
 
     return DashboardSummary(
         total_leads=total,
@@ -342,11 +403,12 @@ def dashboard_summary():
         total_revenue_at_risk=total_risk,
         avg_conversion_probability=round(avg_prob, 1),
         leads_by_stage=stage_counts,
+        pipeline_stages=pipeline_stages,
         urgent_leads=urgent,
         leads_needing_followup=needs_followup,
         leads_at_risk_count=len(leads_at_risk),
         leads_at_risk=leads_at_risk,
         hot_leads=hot_leads,
         followups_due_today=followups_due_today,
-        top_recommendations=top_recommendations,
+        ai_insights=ai_insights,
     )

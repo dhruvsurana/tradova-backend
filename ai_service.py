@@ -188,6 +188,170 @@ def regenerate_followup_message(
     return template.format(contact=contact_person, topic=topic), "fallback"
 
 
+_INSIGHTS_SYSTEM_PROMPT = (
+    "You are a senior sales intelligence analyst for a wholesale/trade business in India. "
+    "You analyze CRM pipeline data and produce 2-4 concise, executive-friendly insights. "
+    "Each insight should surface a meaningful pattern, risk, or opportunity — not repeat individual tasks. "
+    "Be specific with numbers. Avoid generic advice. "
+    "Output valid JSON: a list of 2-4 plain strings. Each string is one insight sentence."
+)
+
+
+def _format_lakh(value: float) -> str:
+    """Format a rupee value as ₹X.XL (lakhs) for readable insight strings."""
+    if value >= 100_000:
+        return f"₹{value / 100_000:.1f}L"
+    return f"₹{value:,.0f}"
+
+
+def generate_ai_insights(
+    total_leads: int,
+    total_pipeline_value: float,
+    total_revenue_at_risk: float,
+    avg_conversion_probability: float,
+    leads_by_stage: dict[str, int],
+    stage_values: dict[str, float],
+    urgent_leads: int,
+    leads_needing_followup: int,
+    at_risk_count: int,
+    hot_lead_count: int,
+    max_inactive_days: int,
+    leads_inactive_over_7: int,
+) -> tuple[list[str], str]:
+    """Return *(insights_list, source)*.
+
+    Each insight is a single readable string.
+    Uses OpenAI when available; otherwise generates template-based fallbacks
+    derived from the live summary data passed in.
+    """
+    if _client:
+        try:
+            import json as _json
+
+            stage_text = ", ".join(
+                f"{s}: {c} leads (₹{stage_values.get(s, 0):,.0f})"
+                for s, c in leads_by_stage.items()
+            )
+            risk_pct = (
+                round(total_revenue_at_risk / total_pipeline_value * 100)
+                if total_pipeline_value > 0
+                else 0
+            )
+            prompt = (
+                f"Analyze this sales pipeline and return 2-4 insights as a JSON list of strings:\n"
+                f"- Total leads: {total_leads}\n"
+                f"- Total pipeline value: ₹{total_pipeline_value:,.0f}\n"
+                f"- Total revenue at risk: ₹{total_revenue_at_risk:,.0f} "
+                f"({risk_pct}% of pipeline)\n"
+                f"- Avg conversion probability: {avg_conversion_probability:.0f}%\n"
+                f"- Stages: {stage_text}\n"
+                f"- Urgent leads (7+ days inactive): {urgent_leads}\n"
+                f"- Leads needing follow-up (5+ days): {leads_needing_followup}\n"
+                f"- At-risk leads: {at_risk_count}\n"
+                f"- Hot/close-ready leads: {hot_lead_count}\n"
+                f"- Max inactivity: {max_inactive_days} days\n"
+                f"- Leads inactive >7 days: {leads_inactive_over_7}\n"
+            )
+            resp = _client.chat.completions.create(
+                model=_MODEL,
+                messages=[
+                    {"role": "system", "content": _INSIGHTS_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.6,
+                max_tokens=400,
+            )
+            text = resp.choices[0].message.content.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            parsed = _json.loads(text)
+            if isinstance(parsed, list) and len(parsed) >= 1:
+                return [str(s) for s in parsed[:4]], "openai"
+        except Exception as exc:
+            logger.warning("OpenAI insights generation failed: %s", exc)
+
+    return _fallback_insights(
+        total_leads=total_leads,
+        total_pipeline_value=total_pipeline_value,
+        total_revenue_at_risk=total_revenue_at_risk,
+        leads_by_stage=leads_by_stage,
+        stage_values=stage_values,
+        urgent_leads=urgent_leads,
+        leads_needing_followup=leads_needing_followup,
+        at_risk_count=at_risk_count,
+        hot_lead_count=hot_lead_count,
+        max_inactive_days=max_inactive_days,
+        leads_inactive_over_7=leads_inactive_over_7,
+    ), "fallback"
+
+
+def _fallback_insights(
+    *,
+    total_leads: int,
+    total_pipeline_value: float,
+    total_revenue_at_risk: float,
+    leads_by_stage: dict[str, int],
+    stage_values: dict[str, float],
+    urgent_leads: int,
+    leads_needing_followup: int,
+    at_risk_count: int,
+    hot_lead_count: int,
+    max_inactive_days: int,
+    leads_inactive_over_7: int,
+) -> list[str]:
+    """Deterministic, template-based insights derived from live pipeline stats."""
+    insights: list[str] = []
+
+    risk_pct = (
+        round(total_revenue_at_risk / total_pipeline_value * 100)
+        if total_pipeline_value > 0
+        else 0
+    )
+    risk_str = _format_lakh(total_revenue_at_risk)
+
+    if risk_pct >= 20:
+        insights.append(
+            f"{risk_str} in revenue is currently at risk across {at_risk_count} deals — "
+            f"that's {risk_pct}% of total pipeline value"
+        )
+
+    if leads_inactive_over_7 >= 2:
+        insights.append(
+            f"{leads_inactive_over_7} leads have been inactive for over a week "
+            f"(longest: {max_inactive_days} days), increasing churn risk"
+        )
+
+    early_stages = {"new", "follow-up"}
+    early_value = sum(stage_values.get(s, 0) for s in early_stages if s in leads_by_stage)
+    early_count = sum(leads_by_stage.get(s, 0) for s in early_stages)
+    if early_count >= 3 and total_pipeline_value > 0 and early_value / total_pipeline_value > 0.3:
+        insights.append(
+            f"Most pipeline value is still in early stages — {early_count} leads worth "
+            f"{_format_lakh(early_value)} have not yet reached negotiation or closing"
+        )
+
+    if hot_lead_count >= 1:
+        closing_value = stage_values.get("closing", 0)
+        if hot_lead_count <= 1:
+            insights.append(
+                f"Only {hot_lead_count} deal is close-ready ({_format_lakh(closing_value)}), "
+                f"indicating weak short-term conversion potential"
+            )
+        else:
+            insights.append(
+                f"{hot_lead_count} deals are close-ready worth {_format_lakh(closing_value)} — "
+                f"prioritize these for near-term revenue"
+            )
+
+    if not insights:
+        insights.append(
+            f"Pipeline is balanced across {len(leads_by_stage)} stages with "
+            f"{_format_lakh(total_pipeline_value)} total value — no critical issues detected"
+        )
+
+    return insights[:4]
+
+
 def generate_conversation_summary(
     company_name: str,
     contact_person: str,
